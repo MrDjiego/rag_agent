@@ -1,0 +1,23 @@
+# Entornos Virtuales
+venv/
+env/
+.venv/
+
+# Variables de Entorno (¡CRÍTICO: NUNCA SUBIR EL .ENV!)
+.env
+
+# Caché de Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Datos Locales y Bases de Datos Vectoriales
+data/raw/
+data/chromadb_store/
+
+# Caché del modelo de embeddings de Chroma (si se descarga aquí)
+.cache/
+
+# Archivos de Sistema Operativo
+.DS_Store
+Thumbs.db
