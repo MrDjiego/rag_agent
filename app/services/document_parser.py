@@ -4,9 +4,8 @@ from typing import List
 from pypdf import PdfReader
 import PIL.Image
 from google import genai
-import base64
 import io
-from openai import OpenAI
+import pymupdf
 
 from app.core.config import settings
 
@@ -32,13 +31,23 @@ class DocumentParser:
             raise ValueError(f"Formato no soportado por el sistema: {ext}")
 
     def _extract_from_pdf(self, file_path: Path) -> str:
-        """Extrae texto de un PDF usando procesamiento local."""
+        """Extrae texto nativo o aplica OCR si el PDF es un escaneo."""
         try:
             reader = PdfReader(str(file_path))
-            text = "".join([page.extract_text() + "\n" for page in reader.pages if page.extract_text()])
-            if not text.strip():
-                raise ValueError("El PDF está vacío o requiere OCR (es un scan sin capa de texto).")
-            return text
+            text_parts = []
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text_parts.append(page_text)
+
+            text = "\n".join(text_parts)
+            if text.strip():
+                return text
+
+            logger.info(
+                f"El PDF '{file_path.name}' no tiene capa de texto. Iniciando OCR..."
+            )
+            return self._ocr_pdf_with_vision(file_path)
         except Exception as e:
             logger.error(f"Error procesando PDF {file_path.name}: {e}")
             raise
@@ -55,61 +64,78 @@ class DocumentParser:
             logger.error(f"Error leyendo archivo de texto {file_path.name}: {e}")
             raise
 
+    def _ocr_pdf_with_vision(self, file_path: Path) -> str:
+        """Renderiza hasta cinco páginas y las procesa con la cascada Gemini."""
+        extracted_pages = []
+
+        with pymupdf.open(file_path) as document:
+            max_pages = min(len(document), 5)
+            for page_number in range(max_pages):
+                logger.info(
+                    f"Aplicando OCR a la página {page_number + 1} de {file_path.name}..."
+                )
+                page = document.load_page(page_number)
+                pixmap = page.get_pixmap(dpi=150)
+                image_bytes = pixmap.tobytes("png")
+
+                with PIL.Image.open(io.BytesIO(image_bytes)) as image:
+                    page_text = self._run_vision_cascade(
+                        image,
+                        f"Página {page_number + 1} del archivo {file_path.name}",
+                    )
+                extracted_pages.append(page_text)
+
+        return "\n\n".join(extracted_pages)
+
     def _extract_from_image(self, file_path: Path) -> str:
-        """Extrae texto usando Gemini con fallback a OpenAI en caso de fallo."""
+        """Extrae texto de una imagen usando la cascada de modelos Gemini."""
         prompt = (
             "Eres un sistema de OCR experto. Extrae todo el texto visible en esta imagen "
             "de forma estructurada y precisa. Respeta el orden lógico de lectura. "
             "No inventes información, devuelve solo el texto extraído."
         )
 
-        # Intento 1: Gemini (Principal)
-        try:
-            logger.info(f"Intentando OCR con Gemini 2.5 Flash para {file_path.name}...")
-            image = PIL.Image.open(file_path)
-            response = self.genai_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=[prompt, image]
-            )
-            return response.text
-        except Exception as e:
-            logger.warning(f"Fallo en Gemini ({e}). Iniciando Fallback a OpenAI...")
+        with PIL.Image.open(file_path) as image:
+            return self._run_vision_cascade(image, file_path.name, prompt)
 
-            # Intento 2: OpenAI Fallback (GPT-4o-mini)
-            if not settings.OPENAI_API_KEY:
-                raise RuntimeError("Falló Gemini y no hay OPENAI_API_KEY configurada para el fallback.")
-            
-            return self._fallback_openai_vision(file_path, prompt)
-
-    def _fallback_openai_vision(self, file_path: Path, prompt: str) -> str:
-        """Ejecuta la llamada a OpenAI transformando la imagen a Base64."""
-        try:
-            logger.info("Ejecutando fallback con OpenAI (gpt-4o-mini)...")
-            openai_client = OpenAI(api_key=settings.OPENAI_API_KEY)
-            
-            with open(file_path, "rb") as image_file:
-                base64_image = base64.b64encode(image_file.read()).decode('utf-8')
-            
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {
-                                "type": "image_url",
-                                "image_url": {"url": f"data:image/jpeg;base64,{base64_image}"}
-                            }
-                        ]
-                    }
-                ],
-                max_tokens=1500
+    def _run_vision_cascade(
+        self,
+        image: PIL.Image.Image,
+        source_name: str,
+        prompt: str | None = None,
+    ) -> str:
+        """Prueba los modelos Gemini configurados en orden para una imagen."""
+        if prompt is None:
+            prompt = (
+                "Eres un sistema de OCR experto. Extrae todo el texto visible en esta imagen "
+                "de forma estructurada y precisa. Respeta el orden lógico de lectura. "
+                "No inventes información, devuelve solo el texto extraído."
             )
-            return response.choices[0].message.content
-        except Exception as e:
-            logger.error(f"Error crítico: Ambos proveedores fallaron para {file_path.name}. Detalle: {e}")
-            raise
+
+        gemini_models = [
+            settings.GEMINI_VISION_MODEL,
+            *settings.GEMINI_VISION_FALLBACK_MODELS,
+        ]
+        gemini_models = list(dict.fromkeys(gemini_models))
+        last_gemini_error = None
+
+        # Prueba los modelos Gemini en orden antes de activar el proveedor alternativo.
+        for model_name in gemini_models:
+            try:
+                logger.info(f"Intentando OCR con {model_name} para {source_name}...")
+                response = self.genai_client.models.generate_content(
+                    model=model_name,
+                    contents=[prompt, image]
+                )
+                return response.text
+            except Exception as e:
+                last_gemini_error = e
+                logger.warning(f"Fallo en Gemini {model_name}: {e}")
+
+        # En el futuro se puede añadir aquí otro proveedor multimodal como fallback.
+        raise RuntimeError(
+            f"Fallaron todos los modelos Gemini configurados para {source_name}."
+        ) from last_gemini_error
 
     def chunk_text(self, text: str) -> List[str]:
         """Divide el texto en chunks con solapamiento estricto."""
